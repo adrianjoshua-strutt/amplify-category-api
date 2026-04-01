@@ -109,6 +109,75 @@ const IAM_TEST_REGEX =
   /!RotateE2eAwsToken-e2eTestContextRole|-integtest$|^amplify-|^eu-|^us-|^ap-|^auth-exhaustive-tests|rds-schema-inspector-integtest|^amplify_e2e_tests_lambda|^JsonMockStack-jsonMockApi|^SubscriptionAuth|^cdkamplifytable[0-9]*-|^MutationConditionTest-|^SearchableAuth|^SubscriptionRTFTests-|^NonModelAuthV2FunctionTransformerTests-|^MultiAuthV2Transformer|^FunctionTransformerTests/;
 const STALE_DURATION_MS = 2 * 60 * 60 * 1000; // 2 hours in milliseconds
 
+/**
+ * Determine if an error is transient (network/server) and worth retrying.
+ */
+const isTransientError = (e: any): boolean => {
+  const transientCodes = ['EHOSTUNREACH', 'ETIMEDOUT', 'ECONNREFUSED', 'ECONNRESET', 'TimeoutError'];
+  if (transientCodes.includes(e?.code) || transientCodes.includes(e?.name)) {
+    return true;
+  }
+  const statusCode = e?.$metadata?.httpStatusCode ?? e?.statusCode;
+  if (statusCode && statusCode >= 500) {
+    return true;
+  }
+  if (e?.name === 'InternalServerErrorException' || e?.name === 'ServiceUnavailableException') {
+    return true;
+  }
+  if (e?.message?.includes('socket hang up') || e?.message?.includes('EHOSTUNREACH') || e?.message?.includes('504')) {
+    return true;
+  }
+  return false;
+};
+
+/**
+ * Determine if an error is an auth/credential error that should NOT be retried.
+ */
+const isAuthError = (e: any): boolean => {
+  const authErrorNames = ['InvalidClientTokenId', 'UnrecognizedClientException', 'AccessDeniedException', 'ExpiredTokenException'];
+  return authErrorNames.includes(e?.name);
+};
+
+/**
+ * Retry a function on transient errors with exponential backoff.
+ * Auth errors are always rethrown immediately.
+ */
+const withRetry = async <T>(fn: () => Promise<T>, label: string, maxRetries = 3, baseDelayMs = 1000): Promise<T> => {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (e: any) {
+      if (isAuthError(e)) {
+        throw e;
+      }
+      if (isTransientError(e) && attempt < maxRetries) {
+        const delay = Math.min(baseDelayMs * Math.pow(2, attempt - 1), 30000);
+        console.warn(`[RETRY] ${label} attempt ${attempt}/${maxRetries} failed: ${e.message}. Retrying in ${delay}ms...`);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw new Error(`withRetry: ${label} exhausted all ${maxRetries} attempts`);
+};
+
+/**
+ * Wrap a resource-gathering function so transient errors return empty results instead of throwing.
+ * Auth errors are still rethrown.
+ */
+const safeGather = async <T>(fn: () => Promise<T[]>, label: string, maxRetries = 3): Promise<T[]> => {
+  try {
+    return await withRetry(fn, label, maxRetries);
+  } catch (e: any) {
+    if (isAuthError(e)) {
+      throw e;
+    }
+    console.warn(`[WARN] ${label} failed after ${maxRetries} retries, returning empty results: ${e.message}`);
+    return [];
+  }
+};
+
 const isCI = (): boolean => !!(process.env.CI && process.env.CODEBUILD);
 /*
  * Exit on expired token as all future requests will fail.
@@ -720,24 +789,51 @@ const getAccountsToCleanup = async (): Promise<AWSAccountInfo[]> => {
 };
 
 const cleanupAccount = async (account: AWSAccountInfo, accountIndex: number, filterPredicate: JobFilterPredicate): Promise<void> => {
-  console.log(`${generateAccountInfo(account, accountIndex)} Starting cleanup process...`);
+  const prefix = generateAccountInfo(account, accountIndex);
+  console.log(`${prefix} Starting cleanup process...`);
 
   try {
-    const appPromises = testRegions.map((region) => getAmplifyApps(account, region));
-    const stackPromises = testRegions.map((region) => getStacks(account, region));
-    const bucketPromise = getS3Buckets(account);
-    const orphanBucketPromise = getOrphanS3TestBuckets(account);
-    const orphanIamRolesPromise = getOrphanTestIamRoles(account);
+    // Use safeGather for each region so one region failure doesn't kill the whole account.
+    // Use Promise.allSettled so individual region failures are isolated.
+    const appResults = await Promise.allSettled(
+      testRegions.map((region) =>
+        safeGather(() => getAmplifyApps(account, region), `${prefix} getAmplifyApps(${region})`),
+      ),
+    );
+    const stackResults = await Promise.allSettled(
+      testRegions.map((region) =>
+        safeGather(() => getStacks(account, region), `${prefix} getStacks(${region})`),
+      ),
+    );
 
-    console.log(`${generateAccountInfo(account, accountIndex)} Gathering resources...`);
-    const apps = (await Promise.all(appPromises)).flat();
-    const stacks = (await Promise.all(stackPromises)).flat();
-    const buckets = await bucketPromise;
-    const orphanBuckets = await orphanBucketPromise;
-    const orphanIamRoles = await orphanIamRolesPromise;
+    const apps = appResults
+      .filter((r): r is PromiseFulfilledResult<AmplifyAppInfo[]> => r.status === 'fulfilled')
+      .flatMap((r) => r.value);
+    const stacks = stackResults
+      .filter((r): r is PromiseFulfilledResult<StackInfo[]> => r.status === 'fulfilled')
+      .flatMap((r) => r.value);
+
+    const failedAppRegions = appResults
+      .map((r, i) => (r.status === 'rejected' ? testRegions[i] : null))
+      .filter(Boolean);
+    const failedStackRegions = stackResults
+      .map((r, i) => (r.status === 'rejected' ? testRegions[i] : null))
+      .filter(Boolean);
+
+    if (failedAppRegions.length > 0) {
+      console.warn(`${prefix} Failed to gather apps in regions: ${failedAppRegions.join(', ')}`);
+    }
+    if (failedStackRegions.length > 0) {
+      console.warn(`${prefix} Failed to gather stacks in regions: ${failedStackRegions.join(', ')}`);
+    }
+
+    console.log(`${prefix} Gathering account-level resources...`);
+    const buckets = await safeGather(() => getS3Buckets(account), `${prefix} getS3Buckets`);
+    const orphanBuckets = await safeGather(() => getOrphanS3TestBuckets(account), `${prefix} getOrphanS3TestBuckets`);
+    const orphanIamRoles = await safeGather(() => getOrphanTestIamRoles(account), `${prefix} getOrphanTestIamRoles`);
 
     console.log(
-      `${generateAccountInfo(account, accountIndex)} Found ${apps.length} apps, ${stacks.length} stacks, ${buckets.length} buckets, ${
+      `${prefix} Found ${apps.length} apps, ${stacks.length} stacks, ${buckets.length} buckets, ${
         orphanBuckets.length
       } orphan buckets, ${orphanIamRoles.length} orphan roles`,
     );
@@ -745,13 +841,13 @@ const cleanupAccount = async (account: AWSAccountInfo, accountIndex: number, fil
     const allResources = await mergeResourcesByCCIJob(apps, stacks, buckets, orphanBuckets, orphanIamRoles);
     const staleResources = _.pickBy(allResources, filterPredicate);
 
-    console.log(`${generateAccountInfo(account, accountIndex)} Found ${Object.keys(staleResources).length} stale resource groups to clean`);
+    console.log(`${prefix} Found ${Object.keys(staleResources).length} stale resource groups to clean`);
 
     generateReport(staleResources, accountIndex);
     await deleteResources(account, accountIndex, staleResources);
-    console.log(`${generateAccountInfo(account, accountIndex)} Cleanup done!`);
+    console.log(`${prefix} Cleanup done!`);
   } catch (error) {
-    console.error(`${generateAccountInfo(account, accountIndex)} Cleanup failed:`, error);
+    console.error(`${prefix} Cleanup failed:`, error);
     throw error;
   }
 };
@@ -795,11 +891,53 @@ const cleanup = async (): Promise<void> => {
   accounts.map((account, i) => {
     console.log(`${generateAccountInfo(account, i)} is under cleanup`);
   });
-  await Promise.all(accounts.map((account, i) => cleanupAccount(account, i, filterPredicate)));
+
+  // Use Promise.allSettled so one account failure doesn't kill other accounts
+  const accountResults = await Promise.allSettled(accounts.map((account, i) => cleanupAccount(account, i, filterPredicate)));
+
+  const failedAccounts: string[] = [];
+  const succeededAccounts: string[] = [];
+  let hasAuthError = false;
+
+  accountResults.forEach((result, i) => {
+    const accountLabel = generateAccountInfo(accounts[i], i);
+    if (result.status === 'fulfilled') {
+      succeededAccounts.push(accountLabel);
+    } else {
+      failedAccounts.push(accountLabel);
+      console.error(`${accountLabel} Cleanup failed:`, result.reason);
+      if (isAuthError(result.reason)) {
+        hasAuthError = true;
+      }
+    }
+  });
+
+  if (failedAccounts.length > 0) {
+    console.warn(`[SUMMARY] ${failedAccounts.length}/${accounts.length} accounts had cleanup failures: ${failedAccounts.join(', ')}`);
+  }
+  if (succeededAccounts.length > 0) {
+    console.log(`[SUMMARY] ${succeededAccounts.length}/${accounts.length} accounts cleaned successfully: ${succeededAccounts.join(', ')}`);
+  }
+
+  // Only exit with error code for auth errors (real problems), not transient failures
+  if (hasAuthError) {
+    console.error('[FATAL] Auth error encountered during cleanup. Exiting with code 1.');
+    process.exitCode = 1;
+  } else if (failedAccounts.length > 0) {
+    console.warn('[WARN] Some accounts had transient failures but cleanup is considered successful overall.');
+  }
+
   console.log('Done cleaning all accounts!');
 };
 
 cleanup().catch((error) => {
-  console.error('Cleanup script failed:', error);
-  process.exit(1);
+  if (isAuthError(error)) {
+    console.error('Cleanup script failed with auth error:', error);
+    process.exitCode = 1;
+  } else if (isTransientError(error)) {
+    console.warn('Cleanup script encountered transient error (will not fail the job):', error.message);
+  } else {
+    console.error('Cleanup script failed:', error);
+    process.exitCode = 1;
+  }
 });
